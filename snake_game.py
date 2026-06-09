@@ -29,8 +29,11 @@ DEFAULT_GRID_INDEX = 1  # 默认选中 "中 (30×20)"
 
 INITIAL_WINDOW_W = 900
 INITIAL_WINDOW_H = 600
+MIN_WINDOW_W = 640
+MIN_WINDOW_H = 480
 MIN_CELL_SIZE = 10
-FPS = 10
+FPS = 60
+MOVE_INTERVAL_MS = 100
 
 # 颜色
 COLOR_BG = (30, 30, 30)
@@ -63,6 +66,7 @@ HELP = "help"
 RECORDS = "records"
 PLAYING = "playing"
 GAME_OVER = "game_over"
+GAME_WON = "game_won"
 
 # 记录文件路径（与脚本同目录）
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -133,22 +137,63 @@ class RecordManager:
         """从 JSON 文件加载记录"""
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
-                self._records = json.load(f)
+                raw_records = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             self._records = []
+            return
+
+        if not isinstance(raw_records, list):
+            self._records = []
+            return
+
+        records = []
+        for raw in raw_records:
+            record = self._normalize_record(raw)
+            if record is not None:
+                records.append(record)
+        self._records = records
 
     def _save(self):
-        """保存记录到 JSON 文件"""
-        with open(self.filepath, "w", encoding="utf-8") as f:
+        """保存记录到 JSON 文件，使用原子替换降低写坏风险。"""
+        tmp_path = f"{self.filepath}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(self._records, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, self.filepath)
+
+    def _normalize_record(self, raw) -> dict | None:
+        """将旧记录保守转换为当前结构；无法修复的记录会被忽略。"""
+        if not isinstance(raw, dict):
+            return None
+
+        required = ("name", "datetime", "score", "duration_seconds")
+        if any(key not in raw for key in required):
+            return None
+
+        name = str(raw["name"]).strip()
+        dt = str(raw["datetime"]).strip()
+        if not name or not dt:
+            return None
+
+        try:
+            score = int(raw["score"])
+            duration_seconds = int(raw["duration_seconds"])
+        except (TypeError, ValueError):
+            return None
+
+        return {
+            "name": name,
+            "datetime": dt,
+            "score": max(0, score),
+            "duration_seconds": max(0, duration_seconds),
+        }
 
     def add_record(self, name: str, score: int, duration_seconds: int):
         """添加一条游戏记录并保存"""
         record = {
-            "name": name,
+            "name": str(name).strip() or "游客",
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "score": score,
-            "duration_seconds": duration_seconds,
+            "score": max(0, int(score)),
+            "duration_seconds": max(0, int(duration_seconds)),
         }
         self._records.append(record)
         self._save()
@@ -159,7 +204,11 @@ class RecordManager:
 
     def get_top_scores(self, limit: int = 20) -> list[dict]:
         """返回分数最高的 N 条记录"""
-        sorted_records = sorted(self._records, key=lambda r: r["score"], reverse=True)
+        sorted_records = sorted(
+            self._records,
+            key=lambda r: int(r.get("score", 0)),
+            reverse=True,
+        )
         return sorted_records[:limit]
 
     def get_unique_players(self) -> list[str]:
@@ -167,7 +216,9 @@ class RecordManager:
         seen = set()
         players = []
         for r in reversed(self._records):
-            name = r["name"]
+            name = str(r.get("name", "")).strip()
+            if not name:
+                continue
             if name not in seen:
                 seen.add(name)
                 players.append(name)
@@ -188,7 +239,6 @@ class Snake:
         self.body = deque([(x, y)])
         self.direction = RIGHT
         self.next_direction = RIGHT
-        self.growing = False
 
     @property
     def head(self):
@@ -201,13 +251,18 @@ class Snake:
         elif (new_dir[0] + self.direction[0], new_dir[1] + self.direction[1]) != (0, 0):
             self.next_direction = new_dir
 
-    def move(self) -> bool:
+    def next_head(self) -> tuple[int, int]:
+        direction = self.next_direction
+        head_x, head_y = self.head
+        return (head_x + direction[0], head_y + direction[1])
+
+    def move(self, grow: bool = False) -> bool:
         self.direction = self.next_direction
         head_x, head_y = self.head
         new_head = (head_x + self.direction[0], head_y + self.direction[1])
 
         # 非增长时尾部即将被弹出，应从碰撞检测中排除
-        if self.growing:
+        if grow:
             if new_head in self.body:
                 return False
         else:
@@ -216,14 +271,9 @@ class Snake:
                 return False
 
         self.body.append(new_head)
-        if self.growing:
-            self.growing = False
-        else:
+        if not grow:
             self.body.popleft()
         return True
-
-    def grow(self):
-        self.growing = True
 
     def draw(self, surface: pygame.Surface, cell_size: int,
              offset_x: int, offset_y: int):
@@ -267,15 +317,18 @@ class Food:
         self.grid_h = grid_h
         self.position = (0, 0)
 
-    def respawn(self, snake_body: set):
+    def respawn(self, snake_body: set) -> bool:
         """在非蛇身且非边界的位置随机生成食物"""
-        while True:
-            # 排除边界 (x=0, x=grid_w-1, y=0, y=grid_h-1)
-            x = random.randint(1, self.grid_w - 2)
-            y = random.randint(1, self.grid_h - 2)
-            if (x, y) not in snake_body:
-                self.position = (x, y)
-                break
+        candidates = [
+            (x, y)
+            for x in range(1, self.grid_w - 1)
+            for y in range(1, self.grid_h - 1)
+            if (x, y) not in snake_body
+        ]
+        if not candidates:
+            return False
+        self.position = random.choice(candidates)
+        return True
 
     def update_grid(self, grid_w: int, grid_h: int):
         """更新网格尺寸（可能使食物位置不合法，需要重新生成）"""
@@ -337,6 +390,8 @@ class Game:
         self.screen = pygame.display.set_mode(
             (self.window_w, self.window_h), pygame.RESIZABLE
         )
+        if hasattr(pygame.display, "set_window_minimum_size"):
+            pygame.display.set_window_minimum_size(MIN_WINDOW_W, MIN_WINDOW_H)
         pygame.display.set_caption("贪吃蛇")
         self.clock = pygame.time.Clock()
 
@@ -360,6 +415,7 @@ class Game:
         self.score = 0
         self.paused = False
         self.frame_count = 0
+        self._last_move_ticks = 0
         self.start_ticks = 0  # 游戏开始的 pygame ticks
         self.pause_started_ticks = 0
         self.total_paused_ticks = 0
@@ -371,6 +427,7 @@ class Game:
         self._cursor_timer = 0
         self._recent_players: list[str] = []
         self._select_index = 0          # 玩家选择中的列表索引
+        self._player_scroll = 0
         self._help_sections: list[dict] = []
         self._help_scroll_y = 0      # 游戏说明的像素级滚动偏移
         self._records_scroll = 0        # 记录查看的滚动位置
@@ -419,10 +476,12 @@ class Game:
         cy = self.grid_h // 2
         self.snake = Snake(cx, cy)
         self.food = Food(self.grid_w, self.grid_h)
-        self.food.respawn(set(self.snake.body))
+        if not self.food.respawn(set(self.snake.body)):
+            self.food = None
         self.score = 0
         self.paused = False
         self.frame_count = 0
+        self._last_move_ticks = pygame.time.get_ticks()
         self.state = PLAYING
         self.start_ticks = pygame.time.get_ticks()
         self.pause_started_ticks = 0
@@ -441,6 +500,7 @@ class Game:
         self._input_text = self.player_name
         self._recent_players = self.records.get_unique_players()
         self._select_index = -1  # -1 表示焦点在输入框
+        self._player_scroll = 0
         self._cursor_timer = 0
         self._cursor_visible = True
 
@@ -555,8 +615,8 @@ class Game:
                 return False
 
             if event.type == pygame.VIDEORESIZE:
-                self.window_w = max(1, event.w)
-                self.window_h = max(1, event.h)
+                self.window_w = max(MIN_WINDOW_W, event.w)
+                self.window_h = max(MIN_WINDOW_H, event.h)
                 self.screen = pygame.display.set_mode(
                     (self.window_w, self.window_h), pygame.RESIZABLE
                 )
@@ -580,6 +640,9 @@ class Game:
                 if not self._handle_playing_events(event):
                     return False
             elif self.state == GAME_OVER:
+                if not self._handle_gameover_events(event):
+                    return False
+            elif self.state == GAME_WON:
                 if not self._handle_gameover_events(event):
                     return False
 
@@ -633,18 +696,22 @@ class Game:
                 # 切换焦点：输入框 <-> 玩家列表
                 if self._select_index == -1 and self._recent_players:
                     self._select_index = 0
+                    self._ensure_selected_player_visible()
                 else:
                     self._select_index = -1
             elif event.key == pygame.K_UP:
                 if self._select_index > 0:
                     self._select_index -= 1
+                    self._ensure_selected_player_visible()
                 elif self._select_index == 0:
                     self._select_index = -1
             elif event.key == pygame.K_DOWN:
                 if self._select_index == -1 and self._recent_players:
                     self._select_index = 0
+                    self._ensure_selected_player_visible()
                 elif self._select_index >= 0 and self._select_index < len(self._recent_players) - 1:
                     self._select_index += 1
+                    self._ensure_selected_player_visible()
             elif self._select_index == -1:
                 # 在输入框中键入
                 if event.key == pygame.K_BACKSPACE:
@@ -654,6 +721,31 @@ class Game:
             elif self._select_index >= 0 and event.key == pygame.K_RETURN:
                 self._confirm_player_selection()
         return True
+
+    def _visible_player_rows(self) -> int:
+        hint_font = self._adaptive_fonts["hint"]
+        title_y = max(self.font_lg.get_height(), int(self.window_h * 0.10))
+        label_y = title_y + self.font_lg.get_height() + max(10, int(self.window_h * 0.03))
+        input_h = max(32, self.font_md.get_height() + 12)
+        list_y = label_y + self.font_md.get_height() + 6 + input_h + max(14, int(self.window_h * 0.035))
+        bottom_limit = self.window_h - hint_font.get_height() * 2 - 10
+        row_h = max(self.font_md.get_height() + 8, int(self.window_h * 0.055))
+        first_row_y = list_y + self.font_md.get_height() + 8
+        return max(0, min(10, (bottom_limit - first_row_y) // row_h))
+
+    def _ensure_selected_player_visible(self):
+        if self._select_index < 0:
+            return
+        visible_rows = self._visible_player_rows()
+        if visible_rows <= 0:
+            self._player_scroll = 0
+            return
+        max_scroll = max(0, len(self._recent_players) - visible_rows)
+        if self._select_index < self._player_scroll:
+            self._player_scroll = self._select_index
+        elif self._select_index >= self._player_scroll + visible_rows:
+            self._player_scroll = self._select_index - visible_rows + 1
+        self._player_scroll = max(0, min(self._player_scroll, max_scroll))
 
     def _confirm_player_selection(self):
         if self._select_index >= 0 and self._select_index < len(self._recent_players):
@@ -745,6 +837,7 @@ class Game:
             if self.pause_started_ticks:
                 self.total_paused_ticks += now - self.pause_started_ticks
             self.pause_started_ticks = 0
+            self._last_move_ticks = now
             self.paused = False
         else:
             self.pause_started_ticks = now
@@ -757,28 +850,41 @@ class Game:
         if self.state != PLAYING:
             return
 
-        # 光标动画（在玩家选择界面也用到，这里仅在 playing 时处理光标重置）
         if self.paused:
             return
 
-        self.frame_count += 1
+        now = pygame.time.get_ticks()
+        if now - self._last_move_ticks < MOVE_INTERVAL_MS:
+            return
+        self._last_move_ticks = now
 
-        if not self.snake.move():
+        self.frame_count += 1
+        next_head = self.snake.next_head()
+        next_x, next_y = next_head
+        if (next_x <= 0 or next_x >= self.grid_w - 1 or
+                next_y <= 0 or next_y >= self.grid_h - 1):
             self._on_game_over()
             return
 
-        if self.snake.head == self.food.position:
-            self.snake.grow()
-            self.score += 10
-            self.food.respawn(set(self.snake.body))
-
-        head_x, head_y = self.snake.head
-        if head_x < 0 or head_x >= self.grid_w or head_y < 0 or head_y >= self.grid_h:
+        eats_food = self.food is not None and next_head == self.food.position
+        if not self.snake.move(grow=eats_food):
             self._on_game_over()
+            return
+
+        if eats_food:
+            self.score += 10
+            if not self.food.respawn(set(self.snake.body)):
+                self._on_game_won()
 
     def _on_game_over(self):
         """游戏结束：保存记录，切换到 GAME_OVER 状态"""
         self.state = GAME_OVER
+        name = self.player_name if self.player_name else "游客"
+        self.records.add_record(name, self.score, self.elapsed_seconds)
+
+    def _on_game_won(self):
+        """所有可用格子被占满，保存记录并切换到胜利状态。"""
+        self.state = GAME_WON
         name = self.player_name if self.player_name else "游客"
         self.records.add_record(name, self.score, self.elapsed_seconds)
 
@@ -806,6 +912,9 @@ class Game:
         elif self.state == GAME_OVER:
             self._draw_playing()
             self._draw_game_over()
+        elif self.state == GAME_WON:
+            self._draw_playing()
+            self._draw_game_won()
 
         pygame.display.flip()
 
@@ -917,13 +1026,24 @@ class Game:
         row_h = max(self.font_md.get_height() + 8, int(self.window_h * 0.055))
         first_row_y = list_y + list_label.get_height() + 8
         visible_players = max(0, min(10, (bottom_limit - first_row_y) // row_h))
+        max_scroll = max(0, len(self._recent_players) - visible_players)
+        self._player_scroll = max(0, min(self._player_scroll, max_scroll))
         if self._recent_players:
-            for i, name in enumerate(self._recent_players[:visible_players]):
-                y = first_row_y + i * row_h
-                color = COLOR_SELECTED if i == self._select_index else COLOR_WHITE
-                prefix = ">> " if i == self._select_index else "   "
+            shown_players = self._recent_players[
+                self._player_scroll:self._player_scroll + visible_players
+            ]
+            for row, name in enumerate(shown_players):
+                player_index = self._player_scroll + row
+                y = first_row_y + row * row_h
+                color = COLOR_SELECTED if player_index == self._select_index else COLOR_WHITE
+                prefix = ">> " if player_index == self._select_index else "   "
                 line = self._render_fit(f"{prefix}{name}", "md", color, form_w)
                 self.screen.blit(line, (form_left, y))
+            if max_scroll > 0:
+                bar_h = max(18, int(visible_players / len(self._recent_players) * visible_players * row_h))
+                bar_y = first_row_y + int(self._player_scroll / max_scroll * (visible_players * row_h - bar_h))
+                bar_rect = pygame.Rect(form_left + form_w + 4, bar_y, 5, bar_h)
+                pygame.draw.rect(self.screen, (100, 100, 120), bar_rect, border_radius=2)
         else:
             no_data = self._render_fit("（暂无历史玩家）", "hint", COLOR_GRAY, form_w)
             self.screen.blit(no_data, (form_left, first_row_y))
@@ -1258,12 +1378,12 @@ class Game:
                 else:
                     rank_color = COLOR_WHITE
 
-                dur = self._format_duration(rec["duration_seconds"])
+                dur = self._format_duration(int(rec.get("duration_seconds", 0)))
                 values = [
                     str(rank),
-                    rec["name"],
-                    str(rec["score"]),
-                    rec["datetime"],
+                    str(rec.get("name", "游客")),
+                    str(rec.get("score", 0)),
+                    str(rec.get("datetime", "")),
                     dur,
                 ]
 
@@ -1379,6 +1499,21 @@ class Game:
         center_y = self.window_h // 2
         gap = max(8, int(self.window_h * 0.035))
         self._draw_center_text_fit("游戏结束!", "huge", COLOR_RED,
+                                   center_y - self.font_huge.get_height() - gap)
+        name = self.player_name if self.player_name else "游客"
+        self._draw_center_text_fit(
+            f"玩家: {name}    分数: {self.score}    时长: {self._format_duration(self.elapsed_seconds)}",
+            "md", COLOR_WHITE, center_y)
+        self._draw_center_text_fit("按 R 再来一局    按 M 返回菜单    按 Q 退出",
+                                   "md", COLOR_GRAY,
+                                   center_y + self.font_md.get_height() + gap)
+
+    def _draw_game_won(self):
+        self._draw_semi_transparent_overlay()
+
+        center_y = self.window_h // 2
+        gap = max(8, int(self.window_h * 0.035))
+        self._draw_center_text_fit("通关成功!", "huge", COLOR_GREEN,
                                    center_y - self.font_huge.get_height() - gap)
         name = self.player_name if self.player_name else "游客"
         self._draw_center_text_fit(
