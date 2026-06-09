@@ -12,6 +12,8 @@ import random
 import sys
 import json
 import os
+import math
+from array import array
 from datetime import datetime
 from collections import deque
 
@@ -34,6 +36,15 @@ MIN_WINDOW_H = 480
 MIN_CELL_SIZE = 10
 FPS = 60
 MOVE_INTERVAL_MS = 100
+GRID_MOVE_INTERVALS_MS = {
+    0: 140,
+    1: 125,
+    2: 110,
+}
+AUDIO_SAMPLE_RATE = 44100
+AUDIO_BUFFER_SIZE = 512
+SFX_VOLUME = 0.45
+MUSIC_VOLUME = 0.22
 
 # 颜色
 COLOR_BG = (30, 30, 30)
@@ -41,6 +52,8 @@ COLOR_GRID = (50, 50, 50)
 COLOR_SNAKE_HEAD = (100, 200, 100)
 COLOR_SNAKE_BODY = (80, 180, 80)
 COLOR_FOOD = (220, 60, 60)
+COLOR_FOOD_BONUS = (255, 190, 70)
+COLOR_FOOD_RARE = (120, 210, 255)
 COLOR_WHITE = (220, 220, 220)
 COLOR_GRAY = (150, 150, 150)
 COLOR_RED = (255, 80, 80)
@@ -52,6 +65,15 @@ COLOR_DIM = (20, 20, 20)
 COLOR_INPUT_BG = (50, 50, 60)
 COLOR_SELECTED = (80, 160, 80)
 COLOR_MENU_OVERLAY = (0, 0, 0, 160)
+COLOR_WALL = (72, 78, 88)
+COLOR_WALL_EDGE = (115, 124, 138)
+COLOR_WALL_SHADOW = (38, 42, 48)
+
+FRUIT_TYPES = [
+    {"name": "normal", "score": 10, "weight": 75, "color": COLOR_FOOD, "glow": (255, 100, 100), "label": ""},
+    {"name": "bonus", "score": 30, "weight": 20, "color": COLOR_FOOD_BONUS, "glow": (255, 225, 120), "label": "+30"},
+    {"name": "rare", "score": 50, "weight": 5, "color": COLOR_FOOD_RARE, "glow": (175, 240, 255), "label": "+50"},
+]
 
 # 方向向量
 UP = (0, -1)
@@ -185,15 +207,18 @@ class RecordManager:
             "datetime": dt,
             "score": max(0, score),
             "duration_seconds": max(0, duration_seconds),
+            "grid_size": str(raw.get("grid_size", "-")).strip() or "-",
         }
 
-    def add_record(self, name: str, score: int, duration_seconds: int):
+    def add_record(self, name: str, score: int, duration_seconds: int,
+                   grid_size: str = "-"):
         """添加一条游戏记录并保存"""
         record = {
             "name": str(name).strip() or "游客",
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "score": max(0, int(score)),
             "duration_seconds": max(0, int(duration_seconds)),
+            "grid_size": str(grid_size).strip() or "-",
         }
         self._records.append(record)
         self._save()
@@ -239,6 +264,7 @@ class Snake:
         self.body = deque([(x, y)])
         self.direction = RIGHT
         self.next_direction = RIGHT
+        self.pending_growth = 0
 
     @property
     def head(self):
@@ -256,13 +282,15 @@ class Snake:
         head_x, head_y = self.head
         return (head_x + direction[0], head_y + direction[1])
 
-    def move(self, grow: bool = False) -> bool:
+    def move(self, grow_amount: int = 0) -> bool:
         self.direction = self.next_direction
         head_x, head_y = self.head
         new_head = (head_x + self.direction[0], head_y + self.direction[1])
+        grow_amount = max(0, int(grow_amount))
+        will_grow = self.pending_growth > 0 or grow_amount > 0
 
         # 非增长时尾部即将被弹出，应从碰撞检测中排除
-        if grow:
+        if will_grow:
             if new_head in self.body:
                 return False
         else:
@@ -271,7 +299,10 @@ class Snake:
                 return False
 
         self.body.append(new_head)
-        if not grow:
+        self.pending_growth += grow_amount
+        if self.pending_growth > 0:
+            self.pending_growth -= 1
+        else:
             self.body.popleft()
         return True
 
@@ -316,6 +347,11 @@ class Food:
         self.grid_w = grid_w
         self.grid_h = grid_h
         self.position = (0, 0)
+        self.kind = FRUIT_TYPES[0]
+
+    @property
+    def score_value(self) -> int:
+        return int(self.kind["score"])
 
     def respawn(self, snake_body: set) -> bool:
         """在非蛇身且非边界的位置随机生成食物"""
@@ -328,6 +364,11 @@ class Food:
         if not candidates:
             return False
         self.position = random.choice(candidates)
+        self.kind = random.choices(
+            FRUIT_TYPES,
+            weights=[fruit["weight"] for fruit in FRUIT_TYPES],
+            k=1,
+        )[0]
         return True
 
     def update_grid(self, grid_w: int, grid_h: int):
@@ -340,13 +381,20 @@ class Food:
         cx = offset_x + self.position[0] * cell_size + cell_size // 2
         cy = offset_y + self.position[1] * cell_size + cell_size // 2
         radius = max(2, cell_size // 2 - 2)
+        color = self.kind["color"]
+        glow = self.kind["glow"]
         if radius > 3:
-            pygame.draw.circle(surface, (255, 100, 100), (cx, cy), radius + 2, 1)
-        pygame.draw.circle(surface, COLOR_FOOD, (cx, cy), radius)
+            pygame.draw.circle(surface, glow, (cx, cy), radius + 2, 1)
+        pygame.draw.circle(surface, color, (cx, cy), radius)
         hl_r = max(1, radius // 3)
         if hl_r > 0:
-            pygame.draw.circle(surface, (255, 150, 150),
+            pygame.draw.circle(surface, glow,
                                (cx - radius // 3, cy - radius // 3), hl_r)
+        label = self.kind.get("label", "")
+        if label and cell_size >= 24:
+            font = pygame.font.SysFont(None, max(10, cell_size // 3), bold=True)
+            text = font.render(label, True, (35, 35, 35))
+            surface.blit(text, text.get_rect(center=(cx, cy)))
 
 
 # ============================================================
@@ -383,6 +431,7 @@ class Game:
     """游戏主类，管理状态机、渲染和事件循环"""
 
     def __init__(self):
+        pygame.mixer.pre_init(AUDIO_SAMPLE_RATE, -16, 1, AUDIO_BUFFER_SIZE)
         pygame.init()
         self.records = RecordManager(RECORDS_FILE)
         self.window_w = INITIAL_WINDOW_W
@@ -394,6 +443,11 @@ class Game:
             pygame.display.set_window_minimum_size(MIN_WINDOW_W, MIN_WINDOW_H)
         pygame.display.set_caption("贪吃蛇")
         self.clock = pygame.time.Clock()
+        self.audio_enabled = False
+        self.sfx: dict[str, pygame.mixer.Sound] = {}
+        self.music_sound: pygame.mixer.Sound | None = None
+        self.music_channel: pygame.mixer.Channel | None = None
+        self._setup_audio()
 
         # 自适应字体缓存（窗口缩放时刷新）
         self._adaptive_fonts: dict[str, pygame.font.Font] = {}
@@ -419,6 +473,7 @@ class Game:
         self.start_ticks = 0  # 游戏开始的 pygame ticks
         self.pause_started_ticks = 0
         self.total_paused_ticks = 0
+        self._resume_countdown_started_ticks = 0
 
         # 菜单/UI 状态
         self._menu_selection = 0        # 菜单当前选中项索引
@@ -428,11 +483,13 @@ class Game:
         self._recent_players: list[str] = []
         self._select_index = 0          # 玩家选择中的列表索引
         self._player_scroll = 0
+        self._player_row_rects: list[tuple[int, pygame.Rect]] = []
         self._help_sections: list[dict] = []
         self._help_scroll_y = 0      # 游戏说明的像素级滚动偏移
         self._records_scroll = 0        # 记录查看的滚动位置
         self._menu_buttons: list[MenuButton] = []
         self._pause_button_rect = pygame.Rect(0, 0, 0, 0)
+        self._pause_quit_button_rect = pygame.Rect(0, 0, 0, 0)
 
     # ---- 网格配置 ----
     def _apply_grid_preset(self):
@@ -441,6 +498,10 @@ class Game:
     def cycle_grid_preset(self, delta: int):
         """切换网格预设"""
         self.grid_index = (self.grid_index + delta) % len(GRID_PRESETS)
+
+    @property
+    def current_move_interval_ms(self) -> int:
+        return GRID_MOVE_INTERVALS_MS.get(self.grid_index, MOVE_INTERVAL_MS)
 
     @property
     def cell_size(self) -> int:
@@ -468,6 +529,115 @@ class Game:
         """格式化秒数为 mm:ss"""
         return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
+    def _current_grid_size(self) -> str:
+        return f"{self.grid_w}x{self.grid_h}"
+
+    # ---- 音频反馈 ----
+    def _setup_audio(self):
+        """初始化内存音效；失败时静默禁用，避免音频设备问题影响游戏。"""
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(AUDIO_SAMPLE_RATE, -16, 1, AUDIO_BUFFER_SIZE)
+            pygame.mixer.set_num_channels(max(8, pygame.mixer.get_num_channels()))
+            self.sfx = {
+                "click": self._make_sound([
+                    (660, 35, "square"),
+                    (880, 45, "square"),
+                ], SFX_VOLUME),
+                "move_select": self._make_sound([
+                    (420, 28, "triangle"),
+                    (560, 34, "triangle"),
+                ], SFX_VOLUME * 0.75),
+                "eat_normal": self._make_sound([
+                    (520, 55, "square"),
+                    (780, 70, "square"),
+                ], SFX_VOLUME),
+                "eat_bonus": self._make_sound([
+                    (620, 50, "square"),
+                    (830, 55, "square"),
+                    (1040, 75, "square"),
+                ], SFX_VOLUME),
+                "eat_rare": self._make_sound([
+                    (740, 45, "square"),
+                    (990, 50, "square"),
+                    (1240, 60, "square"),
+                    (1480, 90, "square"),
+                ], SFX_VOLUME),
+            }
+            self.music_sound = self._make_music_loop()
+            self.music_channel = pygame.mixer.Channel(0)
+            self.music_channel.set_volume(MUSIC_VOLUME)
+            self.audio_enabled = True
+        except pygame.error:
+            self.audio_enabled = False
+            self.sfx = {}
+            self.music_sound = None
+            self.music_channel = None
+
+    def _make_sound(self, segments: list[tuple[int, int, str]], volume: float) -> pygame.mixer.Sound:
+        samples = array("h")
+        amplitude = int(32767 * max(0.0, min(volume, 1.0)))
+        for freq, duration_ms, wave in segments:
+            sample_count = max(1, int(AUDIO_SAMPLE_RATE * duration_ms / 1000))
+            fade_samples = max(1, min(sample_count // 4, int(AUDIO_SAMPLE_RATE * 0.006)))
+            for i in range(sample_count):
+                if freq <= 0:
+                    value = 0.0
+                else:
+                    phase = (i * freq / AUDIO_SAMPLE_RATE) % 1.0
+                    if wave == "triangle":
+                        value = 4.0 * abs(phase - 0.5) - 1.0
+                    else:
+                        value = 1.0 if math.sin(2 * math.pi * phase) >= 0 else -1.0
+                envelope = 1.0
+                if i < fade_samples:
+                    envelope = i / fade_samples
+                elif i >= sample_count - fade_samples:
+                    envelope = (sample_count - i - 1) / fade_samples
+                samples.append(int(max(-32767, min(32767, value * envelope * amplitude))))
+        return pygame.mixer.Sound(buffer=samples.tobytes())
+
+    def _make_music_loop(self) -> pygame.mixer.Sound:
+        melody = [
+            (262, 180, "triangle"), (330, 180, "triangle"),
+            (392, 180, "triangle"), (523, 180, "triangle"),
+            (392, 180, "triangle"), (330, 180, "triangle"),
+            (294, 180, "triangle"), (0, 80, "triangle"),
+            (294, 180, "triangle"), (349, 180, "triangle"),
+            (440, 180, "triangle"), (587, 180, "triangle"),
+            (440, 180, "triangle"), (349, 180, "triangle"),
+            (330, 180, "triangle"), (0, 140, "triangle"),
+        ]
+        return self._make_sound(melody, 0.9)
+
+    def _start_music(self):
+        if not self.audio_enabled or self.music_channel is None or self.music_sound is None:
+            return
+        try:
+            if not self.music_channel.get_busy():
+                self.music_channel.play(self.music_sound, loops=-1)
+        except pygame.error:
+            self.audio_enabled = False
+
+    def _play_sfx(self, name: str):
+        if not self.audio_enabled:
+            return
+        sound = self.sfx.get(name)
+        if sound is None:
+            return
+        try:
+            sound.play()
+        except pygame.error:
+            self.audio_enabled = False
+
+    def _play_eat_sfx(self, fruit_score: int):
+        if fruit_score >= 50:
+            self._play_sfx("eat_rare")
+        elif fruit_score >= 30:
+            self._play_sfx("eat_bonus")
+        else:
+            self._play_sfx("eat_normal")
+
     # ---- 游戏状态切换 ----
     def _start_game(self):
         """切换到游戏状态，初始化蛇和食物"""
@@ -486,11 +656,17 @@ class Game:
         self.start_ticks = pygame.time.get_ticks()
         self.pause_started_ticks = 0
         self.total_paused_ticks = 0
+        self._resume_countdown_started_ticks = 0
         self._pause_button_rect = pygame.Rect(0, 0, 0, 0)
+        self._pause_quit_button_rect = pygame.Rect(0, 0, 0, 0)
 
     def _go_menu(self):
         """返回菜单"""
         self.state = MENU
+        self.paused = False
+        self._resume_countdown_started_ticks = 0
+        self._pause_button_rect = pygame.Rect(0, 0, 0, 0)
+        self._pause_quit_button_rect = pygame.Rect(0, 0, 0, 0)
         self._menu_selection = 0
         self._update_menu_buttons()
 
@@ -501,6 +677,7 @@ class Game:
         self._recent_players = self.records.get_unique_players()
         self._select_index = -1  # -1 表示焦点在输入框
         self._player_scroll = 0
+        self._player_row_rects = []
         self._cursor_timer = 0
         self._cursor_visible = True
 
@@ -654,16 +831,20 @@ class Game:
                 return False
             elif event.key == pygame.K_UP:
                 self._menu_selection = (self._menu_selection - 1) % 5
+                self._play_sfx("move_select")
             elif event.key == pygame.K_DOWN:
                 self._menu_selection = (self._menu_selection + 1) % 5
+                self._play_sfx("move_select")
             elif event.key == pygame.K_LEFT:
                 if self._menu_selection == 4:
                     self.cycle_grid_preset(-1)
                     self._update_menu_buttons()
+                    self._play_sfx("click")
             elif event.key == pygame.K_RIGHT:
                 if self._menu_selection == 4:
                     self.cycle_grid_preset(1)
                     self._update_menu_buttons()
+                    self._play_sfx("click")
             elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                 self._execute_menu_action(self._menu_selection)
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -674,6 +855,7 @@ class Game:
         return True
 
     def _execute_menu_action(self, index: int):
+        self._play_sfx("click")
         if index == 0:
             self._go_player_select()
         elif index == 1:
@@ -689,6 +871,7 @@ class Game:
     def _handle_player_select_events(self, event) -> bool:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
+                self._play_sfx("click")
                 self._go_menu()
             elif event.key == pygame.K_RETURN:
                 self._confirm_player_selection()
@@ -699,19 +882,24 @@ class Game:
                     self._ensure_selected_player_visible()
                 else:
                     self._select_index = -1
+                self._play_sfx("move_select")
             elif event.key == pygame.K_UP:
                 if self._select_index > 0:
                     self._select_index -= 1
                     self._ensure_selected_player_visible()
+                    self._play_sfx("move_select")
                 elif self._select_index == 0:
                     self._select_index = -1
+                    self._play_sfx("move_select")
             elif event.key == pygame.K_DOWN:
                 if self._select_index == -1 and self._recent_players:
                     self._select_index = 0
                     self._ensure_selected_player_visible()
+                    self._play_sfx("move_select")
                 elif self._select_index >= 0 and self._select_index < len(self._recent_players) - 1:
                     self._select_index += 1
                     self._ensure_selected_player_visible()
+                    self._play_sfx("move_select")
             elif self._select_index == -1:
                 # 在输入框中键入
                 if event.key == pygame.K_BACKSPACE:
@@ -720,18 +908,76 @@ class Game:
                     self._input_text += event.unicode
             elif self._select_index >= 0 and event.key == pygame.K_RETURN:
                 self._confirm_player_selection()
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                self._handle_player_select_click(event.pos)
+            elif event.button in (4, 5):
+                delta = -1 if event.button == 4 else 1
+                if self._scroll_player_list(delta):
+                    self._play_sfx("move_select")
+        elif event.type == pygame.MOUSEWHEEL:
+            if self._scroll_player_list(-event.y):
+                self._play_sfx("move_select")
         return True
 
-    def _visible_player_rows(self) -> int:
-        hint_font = self._adaptive_fonts["hint"]
+    def _handle_player_select_click(self, pos: tuple[int, int]):
+        input_rect = self._player_input_rect()
+        if input_rect.collidepoint(pos):
+            self._select_index = -1
+            self._play_sfx("click")
+            return
+
+        for player_index, rect in self._player_row_rects:
+            if rect.collidepoint(pos):
+                self._select_index = player_index
+                self._ensure_selected_player_visible()
+                self._confirm_player_selection()
+                return
+
+    def _scroll_player_list(self, delta: int) -> bool:
+        visible_rows = self._visible_player_rows()
+        max_scroll = max(0, len(self._recent_players) - visible_rows)
+        old_scroll = self._player_scroll
+        self._player_scroll = max(0, min(self._player_scroll + delta, max_scroll))
+        return self._player_scroll != old_scroll
+
+    def _player_layout(self) -> dict[str, int]:
+        margin_x = max(12, min(40, int(self.window_w * 0.06)))
+        form_w = max(20, min(560, self.window_w - margin_x * 2))
+        form_left = (self.window_w - form_w) // 2
         title_y = max(self.font_lg.get_height(), int(self.window_h * 0.10))
         label_y = title_y + self.font_lg.get_height() + max(10, int(self.window_h * 0.03))
+        input_y = label_y + self.font_md.get_height() + 6
         input_h = max(32, self.font_md.get_height() + 12)
-        list_y = label_y + self.font_md.get_height() + 6 + input_h + max(14, int(self.window_h * 0.035))
-        bottom_limit = self.window_h - hint_font.get_height() * 2 - 10
-        row_h = max(self.font_md.get_height() + 8, int(self.window_h * 0.055))
+        list_y = input_y + input_h + max(14, int(self.window_h * 0.035))
         first_row_y = list_y + self.font_md.get_height() + 8
-        return max(0, min(10, (bottom_limit - first_row_y) // row_h))
+        row_h = max(self.font_md.get_height() + 8, int(self.window_h * 0.055))
+        return {
+            "form_left": form_left,
+            "form_w": form_w,
+            "title_y": title_y,
+            "label_y": label_y,
+            "input_y": input_y,
+            "input_h": input_h,
+            "list_y": list_y,
+            "first_row_y": first_row_y,
+            "row_h": row_h,
+        }
+
+    def _player_input_rect(self) -> pygame.Rect:
+        layout = self._player_layout()
+        return pygame.Rect(
+            layout["form_left"],
+            layout["input_y"],
+            layout["form_w"],
+            layout["input_h"],
+        )
+
+    def _visible_player_rows(self) -> int:
+        layout = self._player_layout()
+        hint_font = self._adaptive_fonts["hint"]
+        bottom_limit = self.window_h - hint_font.get_height() * 2 - 10
+        return max(0, min(10, (bottom_limit - layout["first_row_y"]) // layout["row_h"]))
 
     def _ensure_selected_player_visible(self):
         if self._select_index < 0:
@@ -748,6 +994,7 @@ class Game:
         self._player_scroll = max(0, min(self._player_scroll, max_scroll))
 
     def _confirm_player_selection(self):
+        self._play_sfx("click")
         if self._select_index >= 0 and self._select_index < len(self._recent_players):
             self.player_name = self._recent_players[self._select_index]
         elif self._input_text.strip():
@@ -760,40 +1007,57 @@ class Game:
     def _handle_help_events(self, event) -> bool:
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_ESCAPE, pygame.K_b):
+                self._play_sfx("click")
                 self._go_menu()
             elif event.key == pygame.K_DOWN:
                 self._help_scroll_y += 40
+                self._play_sfx("move_select")
             elif event.key == pygame.K_UP:
                 self._help_scroll_y = max(0, self._help_scroll_y - 40)
+                self._play_sfx("move_select")
             elif event.key == pygame.K_PAGEDOWN:
                 self._help_scroll_y += 250
+                self._play_sfx("move_select")
             elif event.key == pygame.K_PAGEUP:
                 self._help_scroll_y = max(0, self._help_scroll_y - 250)
+                self._play_sfx("move_select")
         elif event.type == pygame.MOUSEWHEEL:
             self._help_scroll_y = max(0, self._help_scroll_y - event.y * 35)
+            self._play_sfx("move_select")
         return True
 
     def _handle_records_events(self, event) -> bool:
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_ESCAPE, pygame.K_b):
+                self._play_sfx("click")
                 self._go_menu()
             elif event.key == pygame.K_DOWN:
                 self._records_scroll += 1
+                self._play_sfx("move_select")
             elif event.key == pygame.K_UP:
                 self._records_scroll = max(0, self._records_scroll - 1)
+                self._play_sfx("move_select")
             elif event.key == pygame.K_PAGEUP:
                 self._records_scroll = max(0, self._records_scroll - 10)
+                self._play_sfx("move_select")
             elif event.key == pygame.K_PAGEDOWN:
                 self._records_scroll += 10
+                self._play_sfx("move_select")
         elif event.type == pygame.MOUSEWHEEL:
             self._records_scroll = max(0, self._records_scroll - event.y)
+            self._play_sfx("move_select")
         return True
 
     def _handle_playing_events(self, event) -> bool:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_q:
+                if self.paused:
+                    self._play_sfx("click")
+                    self._go_menu()
+                    return True
                 return False
             elif event.key == pygame.K_p:
+                self._play_sfx("click")
                 self._toggle_pause()
             elif event.key in (pygame.K_UP, pygame.K_w):
                 self._try_set_direction(UP)
@@ -804,13 +1068,19 @@ class Game:
             elif event.key in (pygame.K_RIGHT, pygame.K_d):
                 self._try_set_direction(RIGHT)
             elif event.key == pygame.K_r:
+                self._play_sfx("click")
                 self._start_game()
             elif event.key == pygame.K_m:
+                self._play_sfx("click")
                 self._go_menu()
                 self._update_menu_buttons()
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self._pause_button_rect.collidepoint(event.pos):
+                self._play_sfx("click")
                 self._toggle_pause()
+            elif self.paused and self._pause_quit_button_rect.collidepoint(event.pos):
+                self._play_sfx("click")
+                self._go_menu()
         return True
 
     def _handle_gameover_events(self, event) -> bool:
@@ -818,14 +1088,16 @@ class Game:
             if event.key == pygame.K_q:
                 return False
             elif event.key == pygame.K_r:
+                self._play_sfx("click")
                 self._start_game()
             elif event.key == pygame.K_m:
+                self._play_sfx("click")
                 self._go_menu()
                 self._update_menu_buttons()
         return True
 
     def _try_set_direction(self, new_dir):
-        if self.state == PLAYING and not self.paused:
+        if self.state == PLAYING and not self.paused and not self._resume_countdown_started_ticks:
             self.snake.set_direction(new_dir)
 
     def _toggle_pause(self):
@@ -834,13 +1106,11 @@ class Game:
             return
         now = pygame.time.get_ticks()
         if self.paused:
-            if self.pause_started_ticks:
-                self.total_paused_ticks += now - self.pause_started_ticks
-            self.pause_started_ticks = 0
-            self._last_move_ticks = now
-            self.paused = False
+            if self._resume_countdown_started_ticks == 0:
+                self._resume_countdown_started_ticks = now
         else:
             self.pause_started_ticks = now
+            self._resume_countdown_started_ticks = 0
             self.paused = True
 
     # ================================================================
@@ -851,10 +1121,19 @@ class Game:
             return
 
         if self.paused:
+            if self._resume_countdown_started_ticks:
+                now = pygame.time.get_ticks()
+                if now - self._resume_countdown_started_ticks >= 3000:
+                    if self.pause_started_ticks:
+                        self.total_paused_ticks += now - self.pause_started_ticks
+                    self.pause_started_ticks = 0
+                    self._resume_countdown_started_ticks = 0
+                    self._last_move_ticks = now
+                    self.paused = False
             return
 
         now = pygame.time.get_ticks()
-        if now - self._last_move_ticks < MOVE_INTERVAL_MS:
+        if now - self._last_move_ticks < self.current_move_interval_ms:
             return
         self._last_move_ticks = now
 
@@ -867,12 +1146,15 @@ class Game:
             return
 
         eats_food = self.food is not None and next_head == self.food.position
-        if not self.snake.move(grow=eats_food):
+        fruit_score = self.food.score_value if eats_food else 0
+        grow_amount = fruit_score // 10
+        if not self.snake.move(grow_amount=grow_amount):
             self._on_game_over()
             return
 
         if eats_food:
-            self.score += 10
+            self._play_eat_sfx(fruit_score)
+            self.score += fruit_score
             if not self.food.respawn(set(self.snake.body)):
                 self._on_game_won()
 
@@ -880,13 +1162,15 @@ class Game:
         """游戏结束：保存记录，切换到 GAME_OVER 状态"""
         self.state = GAME_OVER
         name = self.player_name if self.player_name else "游客"
-        self.records.add_record(name, self.score, self.elapsed_seconds)
+        self.records.add_record(name, self.score, self.elapsed_seconds,
+                                self._current_grid_size())
 
     def _on_game_won(self):
         """所有可用格子被占满，保存记录并切换到胜利状态。"""
         self.state = GAME_WON
         name = self.player_name if self.player_name else "游客"
-        self.records.add_record(name, self.score, self.elapsed_seconds)
+        self.records.add_record(name, self.score, self.elapsed_seconds,
+                                self._current_grid_size())
 
     # ================================================================
     # 渲染
@@ -925,9 +1209,7 @@ class Game:
         grid_px_w = cs * self.grid_w
         grid_px_h = cs * self.grid_h
 
-        # 边框
-        pygame.draw.rect(self.screen, COLOR_GRID,
-                         (ox - 1, oy - 1, grid_px_w + 2, grid_px_h + 2), 1)
+        self._draw_wall_blocks(cs, ox, oy)
 
         # 网格线
         if cs >= 15:
@@ -937,6 +1219,30 @@ class Game:
             for row in range(self.grid_h + 1):
                 y = oy + row * cs
                 pygame.draw.line(self.screen, COLOR_GRID, (ox, y), (ox + grid_px_w, y))
+
+        # 边框
+        pygame.draw.rect(self.screen, COLOR_WALL_EDGE,
+                         (ox - 1, oy - 1, grid_px_w + 2, grid_px_h + 2), 1)
+
+    def _draw_wall_blocks(self, cs: int, ox: int, oy: int):
+        """绘制外围墙体方块。"""
+        if self.grid_w <= 1 or self.grid_h <= 1:
+            return
+        edge = max(1, cs // 12)
+        for y in range(self.grid_h):
+            for x in range(self.grid_w):
+                if x not in (0, self.grid_w - 1) and y not in (0, self.grid_h - 1):
+                    continue
+                rect = pygame.Rect(ox + x * cs, oy + y * cs, cs, cs)
+                pygame.draw.rect(self.screen, COLOR_WALL, rect)
+                pygame.draw.line(self.screen, COLOR_WALL_EDGE,
+                                 rect.topleft, rect.topright, edge)
+                pygame.draw.line(self.screen, COLOR_WALL_EDGE,
+                                 rect.topleft, rect.bottomleft, edge)
+                pygame.draw.line(self.screen, COLOR_WALL_SHADOW,
+                                 rect.bottomleft, rect.bottomright, edge)
+                pygame.draw.line(self.screen, COLOR_WALL_SHADOW,
+                                 rect.topright, rect.bottomright, edge)
 
     def _draw_semi_transparent_overlay(self):
         """绘制半透明遮罩"""
@@ -980,10 +1286,10 @@ class Game:
     def _draw_player_select(self):
         self._draw_semi_transparent_overlay()
 
-        margin_x = max(12, min(40, int(self.window_w * 0.06)))
-        form_w = max(20, min(560, self.window_w - margin_x * 2))
-        form_left = (self.window_w - form_w) // 2
-        title_y = max(self.font_lg.get_height(), int(self.window_h * 0.10))
+        layout = self._player_layout()
+        form_left = layout["form_left"]
+        form_w = layout["form_w"]
+        title_y = layout["title_y"]
 
         title = self.font_lg.render("玩家选择", True, COLOR_CYAN)
         title_rect = title.get_rect(center=(self.window_w // 2, title_y))
@@ -991,13 +1297,13 @@ class Game:
 
         # 输入框
         input_label = self.font_md.render("输入玩家名：", True, COLOR_WHITE)
-        label_y = title_y + self.font_lg.get_height() + max(10, int(self.window_h * 0.03))
+        label_y = layout["label_y"]
         self.screen.blit(input_label, (form_left, label_y))
 
         input_x = form_left
-        input_y = label_y + input_label.get_height() + 6
+        input_y = layout["input_y"]
         input_w = form_w
-        input_h = max(32, self.font_md.get_height() + 12)
+        input_h = layout["input_h"]
         # 输入框背景
         pygame.draw.rect(self.screen, COLOR_INPUT_BG,
                          (input_x, input_y, input_w, input_h))
@@ -1017,17 +1323,18 @@ class Game:
         self.screen.blit(text_surf, (input_x + 8, text_y))
 
         # 最近玩家列表
-        list_y = input_y + input_h + max(14, int(self.window_h * 0.035))
+        list_y = layout["list_y"]
         list_label = self.font_md.render("或选择已有玩家：", True, COLOR_WHITE)
         self.screen.blit(list_label, (form_left, list_y))
 
         hint_font = self._adaptive_fonts["hint"]
         bottom_limit = self.window_h - hint_font.get_height() * 2 - 10
-        row_h = max(self.font_md.get_height() + 8, int(self.window_h * 0.055))
-        first_row_y = list_y + list_label.get_height() + 8
+        row_h = layout["row_h"]
+        first_row_y = layout["first_row_y"]
         visible_players = max(0, min(10, (bottom_limit - first_row_y) // row_h))
         max_scroll = max(0, len(self._recent_players) - visible_players)
         self._player_scroll = max(0, min(self._player_scroll, max_scroll))
+        self._player_row_rects = []
         if self._recent_players:
             shown_players = self._recent_players[
                 self._player_scroll:self._player_scroll + visible_players
@@ -1035,6 +1342,10 @@ class Game:
             for row, name in enumerate(shown_players):
                 player_index = self._player_scroll + row
                 y = first_row_y + row * row_h
+                row_rect = pygame.Rect(form_left, y, form_w, row_h)
+                self._player_row_rects.append((player_index, row_rect))
+                if row_rect.collidepoint(pygame.mouse.get_pos()):
+                    pygame.draw.rect(self.screen, (38, 52, 68), row_rect)
                 color = COLOR_SELECTED if player_index == self._select_index else COLOR_WHITE
                 prefix = ">> " if player_index == self._select_index else "   "
                 line = self._render_fit(f"{prefix}{name}", "md", color, form_w)
@@ -1050,7 +1361,7 @@ class Game:
 
         # 底部提示（自适应字体）
         hint = self._render_fit(
-            "输入名称后按 Enter   |   Tab 切换焦点   |   Esc 返回",
+            "点击玩家直接选择   |   输入名称后按 Enter   |   Esc 返回",
             "hint", COLOR_GRAY, self.window_w - 24
         )
         hint_rect = hint.get_rect(
@@ -1300,11 +1611,12 @@ class Game:
             # 列坐标（占窗口宽度的比例 + 对齐方式）
             # 居中左对齐布局：所有列构成一个整体块居中
             cols = [
-                ("排名", 0.08, "left"),     # 排名
-                ("玩家", 0.24, "left"),     # 玩家名
-                ("分数", 0.50, "center"),   # 分数
-                ("日期", 0.65, "left"),     # 日期
-                ("时长", 0.88, "center"),   # 时长
+                ("排名", 0.07, "left"),
+                ("玩家", 0.18, "left"),
+                ("分数", 0.38, "center"),
+                ("网格", 0.50, "center"),
+                ("日期", 0.61, "left"),
+                ("时长", 0.89, "center"),
             ]
 
             # 计算表头各列像素 x 坐标
@@ -1312,11 +1624,12 @@ class Game:
             for _, ratio, align in cols:
                 header_x.append(int(self.window_w * ratio))
             col_limits = [
-                max(28, int(self.window_w * 0.12)),
-                max(40, int(self.window_w * 0.22)),
-                max(34, int(self.window_w * 0.10)),
-                max(70, int(self.window_w * 0.20)),
+                max(28, int(self.window_w * 0.09)),
+                max(40, int(self.window_w * 0.18)),
+                max(34, int(self.window_w * 0.09)),
                 max(42, int(self.window_w * 0.10)),
+                max(70, int(self.window_w * 0.22)),
+                max(42, int(self.window_w * 0.09)),
             ]
 
             # 表头背景
@@ -1383,6 +1696,7 @@ class Game:
                     str(rank),
                     str(rec.get("name", "游客")),
                     str(rec.get("score", 0)),
+                    str(rec.get("grid_size", "-") or "-"),
                     str(rec.get("datetime", "")),
                     dur,
                 ]
@@ -1429,6 +1743,12 @@ class Game:
         if self.state == PLAYING:
             pause_rect = self._get_pause_button_rect(margin)
             self._pause_button_rect = pause_rect
+            if self.paused and not self._resume_countdown_started_ticks:
+                self._pause_quit_button_rect = self._get_pause_quit_button_rect(
+                    margin, pause_rect
+                )
+            else:
+                self._pause_quit_button_rect = pygame.Rect(0, 0, 0, 0)
 
         # 食物和蛇
         if self.food:
@@ -1460,19 +1780,31 @@ class Game:
         dur_y = margin
         if pause_rect:
             dur_y = pause_rect.bottom + 3
+            if self._pause_quit_button_rect.width > 0:
+                dur_y = self._pause_quit_button_rect.bottom + 3
         elif info.get_width() + dur_text.get_width() + margin * 4 > self.window_w:
             dur_y = margin + info.get_height() + 2
         self.screen.blit(dur_text, (dur_x, dur_y))
 
         if self.state == PLAYING and self.paused:
             center_y = self.window_h // 2
-            self._draw_center_text_fit("已暂停", "xl", COLOR_YELLOW,
-                                       center_y - self.font_xl.get_height() // 2)
-            self._draw_center_text_fit("按 P 继续", "md", COLOR_WHITE,
-                                       center_y + self.font_md.get_height())
+            if self._resume_countdown_started_ticks:
+                elapsed = pygame.time.get_ticks() - self._resume_countdown_started_ticks
+                remaining = max(1, 3 - elapsed // 1000)
+                self._draw_center_text_fit(str(remaining), "huge", COLOR_GREEN,
+                                           center_y - self.font_huge.get_height() // 2)
+                self._draw_center_text_fit("准备继续", "md", COLOR_WHITE,
+                                           center_y + self.font_md.get_height())
+            else:
+                self._draw_center_text_fit("已暂停", "xl", COLOR_YELLOW,
+                                           center_y - self.font_xl.get_height() // 2)
+                self._draw_center_text_fit("按 P 继续    按 Q 退出本局", "md", COLOR_WHITE,
+                                           center_y + self.font_md.get_height())
+                if self._pause_quit_button_rect.width > 0:
+                    self._draw_pause_quit_button(self._pause_quit_button_rect)
 
     def _get_pause_button_rect(self, margin: int) -> pygame.Rect:
-        label = "继续" if self.paused else "暂停"
+        label = "倒计时" if self._resume_countdown_started_ticks else ("继续" if self.paused else "暂停")
         text = self._render_fit(label, "hint", COLOR_WHITE, max(32, self.window_w // 3))
         pad_x = max(10, text.get_height() // 2)
         pad_y = max(4, text.get_height() // 4)
@@ -1481,7 +1813,7 @@ class Game:
         return pygame.Rect(self.window_w - width - margin, margin, width, height)
 
     def _draw_pause_button(self, rect: pygame.Rect):
-        label = "继续" if self.paused else "暂停"
+        label = "倒计时" if self._resume_countdown_started_ticks else ("继续" if self.paused else "暂停")
         mouse_pos = pygame.mouse.get_pos()
         hovered = rect.collidepoint(mouse_pos)
         bg = (48, 70, 58) if self.paused else (38, 52, 68)
@@ -1491,6 +1823,32 @@ class Game:
         text = self._render_fit(label, "hint", COLOR_WHITE, max(10, rect.width - 12))
         text_rect = text.get_rect(center=rect.center)
         self.screen.blit(text, text_rect)
+
+    def _get_pause_quit_button_rect(self, margin: int,
+                                    pause_rect: pygame.Rect) -> pygame.Rect:
+        label = "退出本局"
+        text = self._render_fit(label, "hint", COLOR_WHITE, max(32, self.window_w // 3))
+        pad_x = max(10, text.get_height() // 2)
+        pad_y = max(4, text.get_height() // 4)
+        width = text.get_width() + pad_x * 2
+        height = text.get_height() + pad_y * 2
+        return pygame.Rect(
+            self.window_w - width - margin,
+            pause_rect.bottom + 6,
+            width,
+            height,
+        )
+
+    def _draw_pause_quit_button(self, rect: pygame.Rect):
+        mouse_pos = pygame.mouse.get_pos()
+        hovered = rect.collidepoint(mouse_pos)
+        bg = (72, 42, 42)
+        border = COLOR_RED if hovered else COLOR_ORANGE
+        pygame.draw.rect(self.screen, bg, rect, border_radius=4)
+        pygame.draw.rect(self.screen, border, rect, 1, border_radius=4)
+        text = self._render_fit("退出本局", "hint", COLOR_WHITE,
+                                max(10, rect.width - 12))
+        self.screen.blit(text, text.get_rect(center=rect.center))
 
     # ---- 游戏结束叠层 ----
     def _draw_game_over(self):
@@ -1624,6 +1982,7 @@ class Game:
     def run(self):
         self._go_menu()
         self._update_menu_buttons()
+        self._start_music()
 
         running = True
         while running:
