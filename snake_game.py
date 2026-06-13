@@ -43,8 +43,8 @@ GRID_MOVE_INTERVALS_MS = {
 }
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_BUFFER_SIZE = 512
-SFX_VOLUME = 0.45
-MUSIC_VOLUME = 0.22
+SFX_VOLUME = 0.1
+MUSIC_VOLUME = 0.9
 
 # 颜色
 COLOR_BG = (30, 30, 30)
@@ -94,6 +94,7 @@ GAME_WON = "game_won"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RECORDS_FILE = os.path.join(SCRIPT_DIR, "snake_records.json")
 HELP_FILE = os.path.join(SCRIPT_DIR, "help.txt")
+BKG_MUSIC_FILE = os.path.join(SCRIPT_DIR, "bkg.mp3")
 
 # ============================================================
 # 中文字体加载
@@ -474,6 +475,7 @@ class Game:
         self.pause_started_ticks = 0
         self.total_paused_ticks = 0
         self._resume_countdown_started_ticks = 0
+        self._resume_countdown_last_beep = 0
 
         # 菜单/UI 状态
         self._menu_selection = 0        # 菜单当前选中项索引
@@ -539,6 +541,7 @@ class Game:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(AUDIO_SAMPLE_RATE, -16, 1, AUDIO_BUFFER_SIZE)
             pygame.mixer.set_num_channels(max(8, pygame.mixer.get_num_channels()))
+            pygame.mixer.set_reserved(1)
             self.sfx = {
                 "click": self._make_sound([
                     (660, 35, "square"),
@@ -563,8 +566,17 @@ class Game:
                     (1240, 60, "square"),
                     (1480, 90, "square"),
                 ], SFX_VOLUME),
+                "hit_wall": self._make_sound([
+                    (180, 80, "square"),
+                    (110, 110, "triangle"),
+                    (70, 140, "triangle"),
+                ], SFX_VOLUME),
+                "countdown_tick": self._make_sound([
+                    (880, 70, "square"),
+                    (660, 90, "triangle"),
+                ], SFX_VOLUME * 0.85),
             }
-            self.music_sound = self._make_music_loop()
+            self.music_sound = pygame.mixer.Sound(BKG_MUSIC_FILE)
             self.music_channel = pygame.mixer.Channel(0)
             self.music_channel.set_volume(MUSIC_VOLUME)
             self.audio_enabled = True
@@ -596,19 +608,6 @@ class Game:
                     envelope = (sample_count - i - 1) / fade_samples
                 samples.append(int(max(-32767, min(32767, value * envelope * amplitude))))
         return pygame.mixer.Sound(buffer=samples.tobytes())
-
-    def _make_music_loop(self) -> pygame.mixer.Sound:
-        melody = [
-            (262, 180, "triangle"), (330, 180, "triangle"),
-            (392, 180, "triangle"), (523, 180, "triangle"),
-            (392, 180, "triangle"), (330, 180, "triangle"),
-            (294, 180, "triangle"), (0, 80, "triangle"),
-            (294, 180, "triangle"), (349, 180, "triangle"),
-            (440, 180, "triangle"), (587, 180, "triangle"),
-            (440, 180, "triangle"), (349, 180, "triangle"),
-            (330, 180, "triangle"), (0, 140, "triangle"),
-        ]
-        return self._make_sound(melody, 0.9)
 
     def _start_music(self):
         if not self.audio_enabled or self.music_channel is None or self.music_sound is None:
@@ -657,6 +656,7 @@ class Game:
         self.pause_started_ticks = 0
         self.total_paused_ticks = 0
         self._resume_countdown_started_ticks = 0
+        self._resume_countdown_last_beep = 0
         self._pause_button_rect = pygame.Rect(0, 0, 0, 0)
         self._pause_quit_button_rect = pygame.Rect(0, 0, 0, 0)
 
@@ -665,6 +665,7 @@ class Game:
         self.state = MENU
         self.paused = False
         self._resume_countdown_started_ticks = 0
+        self._resume_countdown_last_beep = 0
         self._pause_button_rect = pygame.Rect(0, 0, 0, 0)
         self._pause_quit_button_rect = pygame.Rect(0, 0, 0, 0)
         self._menu_selection = 0
@@ -1108,9 +1109,11 @@ class Game:
         if self.paused:
             if self._resume_countdown_started_ticks == 0:
                 self._resume_countdown_started_ticks = now
+                self._resume_countdown_last_beep = 0
         else:
             self.pause_started_ticks = now
             self._resume_countdown_started_ticks = 0
+            self._resume_countdown_last_beep = 0
             self.paused = True
 
     # ================================================================
@@ -1123,11 +1126,17 @@ class Game:
         if self.paused:
             if self._resume_countdown_started_ticks:
                 now = pygame.time.get_ticks()
-                if now - self._resume_countdown_started_ticks >= 3000:
+                elapsed = now - self._resume_countdown_started_ticks
+                remaining = max(0, 3 - elapsed // 1000)
+                if remaining > 0 and remaining != self._resume_countdown_last_beep:
+                    self._play_sfx("countdown_tick")
+                    self._resume_countdown_last_beep = remaining
+                if elapsed >= 3000:
                     if self.pause_started_ticks:
                         self.total_paused_ticks += now - self.pause_started_ticks
                     self.pause_started_ticks = 0
                     self._resume_countdown_started_ticks = 0
+                    self._resume_countdown_last_beep = 0
                     self._last_move_ticks = now
                     self.paused = False
             return
@@ -1142,6 +1151,7 @@ class Game:
         next_x, next_y = next_head
         if (next_x <= 0 or next_x >= self.grid_w - 1 or
                 next_y <= 0 or next_y >= self.grid_h - 1):
+            self._play_sfx("hit_wall")
             self._on_game_over()
             return
 
@@ -1149,6 +1159,7 @@ class Game:
         fruit_score = self.food.score_value if eats_food else 0
         grow_amount = fruit_score // 10
         if not self.snake.move(grow_amount=grow_amount):
+            self._play_sfx("hit_wall")
             self._on_game_over()
             return
 
